@@ -1,0 +1,259 @@
+name: libxml2
+title: libxml2
+summary: Checks, validates, formats and queries XML files with xmllint, and runs XSLT 1.0 transforms with xsltproc.
+homepage: https://gitlab.gnome.org/GNOME/libxml2
+license: MIT AND ISC-Veillard AND X11
+upstream:
+  source: gitlab-release
+  server: https://gitlab.gnome.org
+  project: GNOME/libxml2
+  # Release tags look like v2.15.4.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 2.15.4
+  artifact:
+    url: https://download.gnome.org/sources/libxml2/{major}.{minor}/libxml2-{version}.tar.xz
+    checksums:
+      url: https://download.gnome.org/sources/libxml2/{major}.{minor}/libxml2-{version}.sha256sum
+      algorithm: sha256
+    sha256: 98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821
+  # xsltproc comes from libxslt, which is pinned by hand: new libxslt releases
+  # are not picked up automatically. To update it, compare the new tarball
+  # with the .sha256sum file next to it on download.gnome.org, then change
+  # version and sha256 together.
+  extra-artifacts:
+    libxslt:
+      version: 1.1.45
+      url: https://download.gnome.org/sources/libxslt/{major}.{minor}/libxslt-{version}.tar.xz
+      sha256: 9acfe68419c4d06a45c550321b3212762d92f41465062ca4ea19e632ee5d216e
+image:
+  entrypoint: [xmllint]
+  cmd: [--version]
+test:
+  - |
+    code=$(printf '%s' "$VERSION" | awk -F. '{ printf "%d%02d%02d", $1, $2, $3 }')
+    # xmllint prints its version and feature list to stderr.
+    xmllint --version 2> version.txt
+    if [ "$(head -n 1 version.txt)" != "xmllint: using libxml version $code" ]; then
+      cat version.txt >&2
+      echo "expected libxml version $code" >&2
+      exit 1
+    fi
+    for f in Schemas RelaxNG XPath C14N Catalog Iconv; do
+      grep -Fq " $f " version.txt || { cat version.txt >&2; echo "missing feature: $f" >&2; exit 1; }
+    done
+    xsltproc --version > xsltproc-version.txt
+    grep -Fq "Using libxml $code, libxslt " xsltproc-version.txt \
+      || { cat xsltproc-version.txt >&2; echo "xsltproc does not use libxml $code" >&2; exit 1; }
+    # The libraries come from /usr/local/lib, never from a distro package.
+    ldd /usr/local/bin/xsltproc > ldd.txt
+    for lib in libxml2 libxslt libexslt; do
+      path=$(awk -v lib="$lib.so." 'index($1, lib) == 1 { print $3 }' ldd.txt)
+      case "$path" in
+        /usr/local/lib/*) ;;
+        *) cat ldd.txt >&2; echo "$lib is not loaded from /usr/local/lib" >&2; exit 1 ;;
+      esac
+    done
+  - |
+    printf '<?xml version="1.0"?>\n<doc><item>one</item></doc>\n' > good.xml
+    printf '<doc><item>one</doc>\n' > broken.xml
+    xmllint --noout good.xml
+    # Exit status 4 means the file is not well formed or cannot be read.
+    for f in broken.xml missing.xml; do
+      rc=0
+      xmllint --noout "$f" 2> "$f.err" || rc=$?
+      if [ "$rc" != 4 ]; then
+        cat "$f.err" >&2
+        echo "$f: expected exit status 4, got $rc" >&2
+        exit 1
+      fi
+    done
+    grep -Fq 'broken.xml:1:' broken.xml.err || { cat broken.xml.err >&2; exit 1; }
+  - |
+    # Exit status 3 is a validation error, as opposed to a parse or schema error.
+    invalid() {
+      rc=0
+      xmllint --noout "$@" 2> invalid.err || rc=$?
+      if [ "$rc" != 3 ]; then
+        cat invalid.err >&2
+        echo "xmllint --noout $*: expected exit status 3, got $rc" >&2
+        exit 1
+      fi
+    }
+    cat > order.xsd <<'EOF'
+    <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:element name="order">
+        <xs:complexType>
+          <xs:sequence>
+            <xs:element name="item" type="xs:string" maxOccurs="unbounded"/>
+          </xs:sequence>
+          <xs:attribute name="qty" type="xs:positiveInteger" use="required"/>
+        </xs:complexType>
+      </xs:element>
+    </xs:schema>
+    EOF
+    printf '<order qty="2"><item>pen</item></order>\n' > order.xml
+    printf '<order qty="0"><item>pen</item></order>\n' > order-bad.xml
+    xmllint --noout --schema order.xsd order.xml
+    invalid --schema order.xsd order-bad.xml
+    printf '%s\n' '<!ELEMENT note (to, body)>' '<!ELEMENT to (#PCDATA)>' '<!ELEMENT body (#PCDATA)>' > note.dtd
+    printf '<note><to>Ann</to><body>Hi</body></note>\n' > note.xml
+    printf '<note><body>Hi</body></note>\n' > note-bad.xml
+    xmllint --noout --dtdvalid note.dtd note.xml
+    invalid --dtdvalid note.dtd note-bad.xml
+    cat > list.xml <<'EOF'
+    <?xml version="1.0"?>
+    <!DOCTYPE list [
+    <!ELEMENT list (item+)>
+    <!ELEMENT item (#PCDATA)>
+    <!ATTLIST item id ID #REQUIRED>
+    ]>
+    <list><item id="a">one</item><item id="b">two</item></list>
+    EOF
+    sed 's/id="b"/id="a"/' list.xml > list-bad.xml
+    xmllint --noout --valid list.xml
+    invalid --valid list-bad.xml
+    cat > book.rng <<'EOF'
+    <element name="book" xmlns="http://relaxng.org/ns/structure/1.0"
+        datatypeLibrary="http://www.w3.org/2001/XMLSchema-datatypes">
+      <attribute name="pages"><data type="positiveInteger"/></attribute>
+      <element name="title"><text/></element>
+    </element>
+    EOF
+    printf '<book pages="120"><title>XML</title></book>\n' > book.xml
+    printf '<book pages="many"><title>XML</title></book>\n' > book-type.xml
+    printf '<book pages="120"/>\n' > book-missing.xml
+    xmllint --noout --relaxng book.rng book.xml
+    invalid --relaxng book.rng book-type.xml
+    invalid --relaxng book.rng book-missing.xml
+  - |
+    same() {
+      [ "$1" = "$2" ] || { printf 'expected: %s\ngot: %s\n' "$2" "$1" >&2; exit 1; }
+    }
+    printf '<a><b>first</b><c/></a>\n' > in.xml
+    same "$(xmllint --xpath 'string(/a/b)' in.xml)" first
+    xmllint --format in.xml > formatted.xml
+    printf '<?xml version="1.0"?>\n<a>\n  <b>first</b>\n  <c/>\n</a>\n' > formatted.expected
+    cmp formatted.xml formatted.expected || { cat formatted.xml >&2; exit 1; }
+    # Canonical XML sorts the attributes, uses double quotes and writes empty
+    # elements as start and end tags.
+    cat > c14n.xml <<'EOF'
+    <?xml version="1.0"?>
+    <a  z='2' b="1"><c/></a>
+    EOF
+    printf '<a b="1" z="2"><c></c></a>' > c14n.expected
+    xmllint --c14n c14n.xml > c14n.out
+    cmp c14n.out c14n.expected || { cat c14n.out >&2; exit 1; }
+    # The HTML parser closes the first p when the second one opens.
+    printf '<!DOCTYPE html>\n<html><head><title>Notes</title></head><body><p>one<p>two</body></html>\n' > page.html
+    same "$(xmllint --html --xpath 'count(//p)' page.html)" 2
+    same "$(xmllint --html --xpath 'string(//title)' page.html)" Notes
+  - |
+    # Byte 0xA4 is the euro sign in ISO-8859-15 (it is the currency sign in
+    # ISO-8859-1), so the conversion goes through iconv.
+    printf '<?xml version="1.0" encoding="ISO-8859-15"?>\n<a>\244</a>\n' > latin9.xml
+    xmllint --encode UTF-8 latin9.xml > utf8.xml
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<a>\342\202\254</a>\n' > utf8.expected
+    cmp utf8.xml utf8.expected || { od -c utf8.xml >&2; exit 1; }
+    xmllint --encode ISO-8859-15 utf8.xml > latin9-again.xml
+    cmp latin9-again.xml latin9.xml || { od -c latin9-again.xml >&2; exit 1; }
+    # 0xB1 is a with ogonek in ISO-8859-2, 0xDF is Cyrillic capital ya in
+    # windows-1251, and 0x82 0xA0 is hiragana a in Shift_JIS. libxml2 leaves
+    # all three to iconv. glibc has the ISO-8859-15 converter in libc6 but
+    # loads these from libc-gconv-modules-extra; musl has them built in.
+    printf '<?xml version="1.0" encoding="ISO-8859-2"?>\n<a>\261</a>\n' > latin2.xml
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<a>\304\205</a>\n' > latin2-utf8.expected
+    printf '<?xml version="1.0" encoding="windows-1251"?>\n<a>\337</a>\n' > cp1251.xml
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<a>\320\257</a>\n' > cp1251-utf8.expected
+    printf '<?xml version="1.0" encoding="Shift_JIS"?>\n<a>\202\240</a>\n' > sjis.xml
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<a>\343\201\202</a>\n' > sjis-utf8.expected
+    for f in latin2 cp1251 sjis; do
+      xmllint --encode UTF-8 "$f.xml" > "$f-utf8.xml"
+      cmp "$f-utf8.xml" "$f-utf8.expected" \
+        || { od -c "$f-utf8.xml" >&2; echo "$f.xml: wrong UTF-8 output" >&2; exit 1; }
+    done
+    xmllint --encode ISO-8859-2 latin2-utf8.xml > latin2-again.xml
+    cmp latin2-again.xml latin2.xml || { od -c latin2-again.xml >&2; exit 1; }
+  - |
+    # A catalog maps an http:// system identifier to a local file. libxml2
+    # has no HTTP client, so without the catalog xmllint finds no DTD. The
+    # invalid document shows that the DTD is read through the catalog.
+    printf '%s\n' '<!ELEMENT doc (title)>' '<!ELEMENT title (#PCDATA)>' > d.dtd
+    printf '<?xml version="1.0"?>\n<!DOCTYPE doc SYSTEM "http://example.org/d.dtd">\n<doc><title>T</title></doc>\n' > doc.xml
+    printf '<?xml version="1.0"?>\n<!DOCTYPE doc SYSTEM "http://example.org/d.dtd">\n<doc/>\n' > doc-bad.xml
+    xmlcatalog --create --noout cat.xml
+    xmlcatalog --noout --add system http://example.org/d.dtd "file://$PWD/d.dtd" cat.xml
+    resolved=$(xmlcatalog cat.xml http://example.org/d.dtd)
+    if [ "$resolved" != "file://$PWD/d.dtd" ]; then
+      cat cat.xml >&2
+      echo "the catalog resolves to '$resolved'" >&2
+      exit 1
+    fi
+    XML_CATALOG_FILES="$PWD/cat.xml" xmllint --noout --valid doc.xml 2> doc.err
+    if grep -Fq 'no DTD found' doc.err; then cat doc.err >&2; exit 1; fi
+    rc=0
+    XML_CATALOG_FILES="$PWD/cat.xml" xmllint --noout --valid doc-bad.xml 2> doc-bad.err || rc=$?
+    if [ "$rc" != 3 ]; then
+      cat doc-bad.err >&2
+      echo "doc-bad.xml: expected exit status 3, got $rc" >&2
+      exit 1
+    fi
+    xmllint --noout --valid --nocatalogs doc.xml 2> nocatalogs.err || true
+    grep -Fq 'no DTD found' nocatalogs.err || { cat nocatalogs.err >&2; exit 1; }
+  - |
+    same() {
+      [ "$1" = "$2" ] || { printf 'expected: %s\ngot: %s\n' "$2" "$1" >&2; exit 1; }
+    }
+    printf '<?xml version="1.0"?>\n<nums><n>3</n><n>11</n><n>7</n></nums>\n' > nums.xml
+    cat > identity.xsl <<'EOF'
+    <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+      <xsl:template match="@*|node()">
+        <xsl:copy><xsl:apply-templates select="@*|node()"/></xsl:copy>
+      </xsl:template>
+    </xsl:stylesheet>
+    EOF
+    xsltproc identity.xsl nums.xml > copy.xml
+    cmp copy.xml nums.xml || { cat copy.xml >&2; exit 1; }
+    cat > greet.xsl <<'EOF'
+    <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+      <xsl:output method="text"/>
+      <xsl:param name="who" select="'nobody'"/>
+      <xsl:template match="/">Hello, <xsl:value-of select="$who"/></xsl:template>
+    </xsl:stylesheet>
+    EOF
+    xsltproc -o greeting.txt --stringparam who world greet.xsl nums.xml
+    same "$(cat greeting.txt)" 'Hello, world'
+    cat > exslt.xsl <<'EOF'
+    <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+        xmlns:math="http://exslt.org/math" xmlns:str="http://exslt.org/strings">
+      <xsl:output method="text"/>
+      <xsl:template match="/">
+        <xsl:value-of select="math:max(/nums/n)"/>
+        <xsl:for-each select="str:tokenize('2026-10-02', '-')">
+          <xsl:text> </xsl:text>
+          <xsl:value-of select="."/>
+        </xsl:for-each>
+      </xsl:template>
+    </xsl:stylesheet>
+    EOF
+    same "$(xsltproc exslt.xsl nums.xml)" '11 2026 10 02'
+    printf '%s\n' '<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">' \
+      '<xsl:template match="/"><xsl:value-of select="1 +"/></xsl:template>' \
+      '</xsl:stylesheet>' > broken.xsl
+    if xsltproc broken.xsl nums.xml > broken.out 2> broken.err; then
+      echo "broken.xsl was accepted" >&2
+      exit 1
+    fi
+    test -s broken.err || { echo "xsltproc failed without a message" >&2; exit 1; }
+examples:
+  - title: Check that an XML file is well formed
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/libxml2 --noout document.xml
+  - title: Validate a file against an XML Schema
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/libxml2 --noout --schema schema.xsd document.xml
+  - title: Indent an XML file
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/libxml2 --format --output formatted.xml document.xml
+  - title: Print the result of an XPath expression
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/libxml2 --xpath 'string(/feed/title)' document.xml
+  - title: Transform a file with an XSLT stylesheet
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint xsltproc ghcr.io/randomcontainers/libxml2 -o output.html style.xsl document.xml
