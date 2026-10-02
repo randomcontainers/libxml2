@@ -1,0 +1,165 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS source
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      curl \
+      xz
+# GNOME keeps each release series in its own directory. libxslt is pinned by
+# hand to the 1.1 series; the libxml2 directory follows VERSION (2.15 for
+# 2.15.4), which ADD cannot derive, so that tarball is fetched with curl.
+ARG LIBXSLT_VERSION
+ARG LIBXSLT_SHA256
+ADD --checksum=sha256:${LIBXSLT_SHA256} https://download.gnome.org/sources/libxslt/1.1/libxslt-${LIBXSLT_VERSION}.tar.xz /tmp/
+ARG VERSION
+ARG SOURCE_SHA256
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${LIBXSLT_VERSION}" | grep -Eqx '1\.1\.[0-9]+' \
+      || { echo "unexpected LIBXSLT_VERSION: ${LIBXSLT_VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_SHA256}" | grep -Eqx '[0-9a-f]{64}' \
+      || { echo "SOURCE_SHA256 must be the tarball's sha256" >&2; exit 1; }; \
+    url="https://download.gnome.org/sources/libxml2/${VERSION%.*}/libxml2-${VERSION}.tar.xz"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/libxml2.tar.xz "$url"; \
+    echo "${SOURCE_SHA256}  /tmp/libxml2.tar.xz" | sha256sum -c -; \
+    mkdir -p /src/libxml2 /src/libxslt; \
+    tar -xJf /tmp/libxml2.tar.xz -C /src/libxml2 --strip-components=1; \
+    tar -xJf "/tmp/libxslt-${LIBXSLT_VERSION}.tar.xz" -C /src/libxslt --strip-components=1; \
+    printf '%s\n' "$url" "https://download.gnome.org/sources/libxslt/1.1/libxslt-${LIBXSLT_VERSION}.tar.xz" \
+      > /src/source-urls
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      build-base \
+      pkgconf \
+      scanelf
+COPY --link --from=source /src /src
+ARG JOBS
+
+# zlib, ICU, readline and the Python bindings are left out, so the programs
+# load only the C library, which also provides iconv. --sysconfdir only sets
+# the default catalog, file:///etc/xml/catalog; nothing is installed there.
+# libxml2 also goes into /usr/local of this stage, where the libxslt build
+# finds it. Alpine's own libxml2 has another soname, libxml2.so.2.
+WORKDIR /src/libxml2
+RUN ./configure \
+      --prefix=/usr/local \
+      --sysconfdir=/etc \
+      --disable-static \
+      --without-docs \
+      --without-history \
+      --without-python \
+      --without-readline \
+      --without-zlib \
+      CFLAGS='-O2 -fno-semantic-interposition'; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make install; \
+    make DESTDIR=/out install-strip; \
+    test ! -e /out/etc
+
+# The EXSLT crypto functions, which need libgcrypt, are left out, as are
+# plugins and the Python bindings.
+WORKDIR /src/libxslt
+RUN ./configure \
+      --prefix=/usr/local \
+      --disable-static \
+      --without-crypto \
+      --without-plugins \
+      --without-python \
+      CFLAGS=-O2 \
+      PKG_CONFIG_PATH=/usr/local/lib/pkgconfig; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make DESTDIR=/out install-strip
+
+ARG BASE_IMAGE
+ARG VERSION
+ARG SOURCE_SHA256
+ARG LIBXSLT_VERSION
+ARG LIBXSLT_SHA256
+# configure leaves out an optional feature without failing when something it
+# needs is missing, so xmllint's feature list is checked here. dict.c, list.c
+# and timsort.h have notices of their own besides the Copyright files.
+# runtime-deps lists the so: names the programs need, minus the libraries
+# built here, plus the packages in runtime-deps.alpine. Only musl is
+# expected.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    rm -rf \
+      /out/usr/local/include \
+      /out/usr/local/lib/cmake \
+      /out/usr/local/lib/pkgconfig \
+      /out/usr/local/share/aclocal \
+      /out/usr/local/share/doc \
+      /out/usr/local/share/gtk-doc \
+      /out/usr/local/share/man; \
+    rm -f \
+      /out/usr/local/bin/xml2-config \
+      /out/usr/local/bin/xslt-config \
+      /out/usr/local/lib/*.la \
+      /out/usr/local/lib/*Conf.sh; \
+    bins=; \
+    for f in /out/usr/local/bin/*; do bins="$bins ${f##*/}"; done; \
+    test "$bins" = ' xmlcatalog xmllint xsltproc' || { echo "unexpected programs:$bins" >&2; exit 1; }; \
+    export LD_LIBRARY_PATH=/out/usr/local/lib; \
+    code="$(printf '%s' "${VERSION}" | awk -F. '{ printf "%d%02d%02d", $1, $2, $3 }')"; \
+    xslt_code="$(printf '%s' "${LIBXSLT_VERSION}" | awk -F. '{ printf "%d%02d%02d", $1, $2, $3 }')"; \
+    /out/usr/local/bin/xmllint --version 2> /tmp/xmllint-version; \
+    wrong=; \
+    grep -Fq "using libxml version ${code}" /tmp/xmllint-version || wrong="$wrong, version"; \
+    for f in C14N Catalog DTDValid HTML Iconv Output Reader Regexps RelaxNG Schemas Threads Writer XInclude XPath XPointer; do \
+      grep -Fq " $f " /tmp/xmllint-version || wrong="$wrong, $f missing"; \
+    done; \
+    for f in ICU Schematron Zlib; do \
+      if grep -Fq " $f " /tmp/xmllint-version; then wrong="$wrong, $f built"; fi; \
+    done; \
+    if [ -n "$wrong" ]; then cat /tmp/xmllint-version >&2; echo "xmllint: ${wrong#, }" >&2; exit 1; fi; \
+    /out/usr/local/bin/xsltproc --version > /tmp/xsltproc-version; \
+    grep -Fq "Using libxml ${code}, libxslt ${xslt_code} " /tmp/xsltproc-version \
+      || { cat /tmp/xsltproc-version >&2; exit 1; }; \
+    grep -Fq "xsltproc was compiled against libxml ${code}, libxslt ${xslt_code} " /tmp/xsltproc-version \
+      || { cat /tmp/xsltproc-version >&2; exit 1; }; \
+    meta=/out/usr/local/share/randomcontainers/libxml2; \
+    mkdir -p "$meta/licenses"; \
+    cp /src/libxml2/Copyright "$meta/licenses/COPYING.libxml2"; \
+    cp /src/libxslt/Copyright "$meta/licenses/COPYING.libxslt"; \
+    for f in dict.c list.c timsort.h; do \
+      awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Copyright/) { printf "%s", b; exit } }' \
+        "/src/libxml2/$f" > "$meta/licenses/COPYING.${f%.*}"; \
+      test -s "$meta/licenses/COPYING.${f%.*}"; \
+    done; \
+    echo "${VERSION}" > "$meta/version"; \
+    cp /src/source-urls "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "source-sha256: ${SOURCE_SHA256}"; \
+      echo "libxslt: ${LIBXSLT_VERSION}"; \
+      echo "libxslt-sha256: ${LIBXSLT_SHA256}"; \
+      sed -n 's/^  \$ \(\.\/configure .*\)/\1/p' /src/libxml2/config.log /src/libxslt/config.log; \
+      sed -n 2p /tmp/xmllint-version; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    grep -q '^so:libc\.musl-' /tmp/elf-deps; \
+    if grep -v '^so:libc\.musl-' /tmp/elf-deps > /tmp/elf-unexpected; then \
+      echo "unexpected run-time libraries:" >&2; cat /tmp/elf-unexpected >&2; exit 1; \
+    fi; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /usr/local/share/randomcontainers/libxml2/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "xmllint"]
+CMD ["--version"]
